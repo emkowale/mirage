@@ -3,7 +3,7 @@
  * Plugin Name: Mirage – Conditional Payments for WooCommerce
  * Description: Forces Authorize.Net when the cart contains any product in the “Merch” category, and auto-updates from GitHub Releases.
  * Author: Eric Kowalewski
- * Version: 1.0.1
+ * Version: 1.0.2
  * Update URI: github.com/emkowale/mirage
  * Last Updated: 2025-10-05 09:35 EDT
  */
