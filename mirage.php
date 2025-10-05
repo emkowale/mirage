@@ -1,112 +1,97 @@
 <?php
 /*
  * Plugin Name: Mirage – Conditional Payments for WooCommerce
- * Description: Forces Authorize.Net when the cart contains any product in the “Merch” category, and auto-updates from GitHub Releases.
+ * Description: Enforces Merch-only carts and restricts gateways: only Merch carts can use Authorize.Net; non-Merch carts cannot.
  * Author: Eric Kowalewski
- * Version: 1.0.2
+ * Version: 1.0.3
  * Update URI: github.com/emkowale/mirage
- * Last Updated: 2025-10-05 09:35 EDT
+ * Last Updated: 2025-10-05 09:55 EDT
  */
-
 if (!defined('ABSPATH')) exit;
 
-/* ======================
-   Settings (edit as needed)
-   ====================== */
-define('MIRAGE_REPO',       'emkowale/mirage'); // owner/repo
-define('MIRAGE_SLUG',       'mirage');          // folder name under wp-content/plugins
-define('MIRAGE_FILE',       'mirage/mirage.php');
-define('MIRAGE_CAT_SLUGS',  serialize(['merch']));
-// Common Authorize.Net IDs (SkyVerge): credit card + eCheck
-define('MIRAGE_AUTHNET_IDS', serialize(['authorize_net_cim_credit_card','authorize_net_echeck']));
+/* ===== Config ===== */
+define('MIRAGE_TARGET_CAT', 'merch'); // category slug
+// Authorize.Net gateway IDs (adjust if yours differ)
+define('MIRAGE_AUTHNET_IDS_JSON', '["authorize_net_cim_credit_card","authorize_net_echeck"]');
 
-/* ======================
-   Force Authorize.Net for Merch
-   ====================== */
-add_filter('woocommerce_available_payment_gateways', function ($gateways) {
-    if (is_admin() || !function_exists('WC') || !is_checkout() || !WC()->cart || WC()->cart->is_empty()) return $gateways;
-    $target_slugs = unserialize(MIRAGE_CAT_SLUGS);
-    $contains_target = false;
+/* ===== Helpers ===== */
+function mirage_item_is_merch($product_id){
+    // consider variations too
+    if (has_term(MIRAGE_TARGET_CAT, 'product_cat', $product_id)) return true;
+    $parent_id = wp_get_post_parent_id($product_id);
+    return $parent_id ? has_term(MIRAGE_TARGET_CAT, 'product_cat', $parent_id) : false;
+}
+function mirage_cart_stats(){
+    $stats = ['merch'=>0,'other'=>0,'total'=>0];
+    if (!function_exists('WC') || !WC()->cart) return $stats;
+    foreach (WC()->cart->get_cart() as $item){
+        $pid = $item['variation_id'] ?: $item['product_id'];
+        $is_merch = mirage_item_is_merch($pid);
+        $stats['total']++;
+        $is_merch ? $stats['merch']++ : $stats['other']++;
+    }
+    return $stats;
+}
 
-    foreach (WC()->cart->get_cart() as $item) {
-        $pid = isset($item['variation_id']) && $item['variation_id'] ? $item['variation_id'] : $item['product_id'];
-        $terms = get_the_terms($pid, 'product_cat');
-        if (empty($terms) || is_wp_error($terms)) continue;
-        foreach ($terms as $t) {
-            if (in_array($t->slug, $target_slugs, true)) { $contains_target = true; break 2; }
+/* ===== 1) Block mixing Merch with non-Merch at add-to-cart ===== */
+add_filter('woocommerce_add_to_cart_validation', function($valid, $product_id, $qty, $variation_id = 0){
+    if (is_admin()) return $valid;
+    $incoming_is_merch = mirage_item_is_merch($variation_id ?: $product_id);
+    $stats = mirage_cart_stats();
+
+    // If cart already has items, enforce purity
+    if ($stats['total'] > 0){
+        $cart_is_merch_only  = ($stats['merch'] > 0 && $stats['other'] === 0);
+        $cart_is_other_only  = ($stats['other'] > 0 && $stats['merch'] === 0);
+
+        // Disallow mixing
+        if (($cart_is_merch_only && !$incoming_is_merch) || ($cart_is_other_only && $incoming_is_merch)){
+            wc_add_notice(sprintf(
+                'You can’t mix <strong>%s</strong> items with other categories in the same cart. Please complete this purchase separately.',
+                esc_html(ucfirst(MIRAGE_TARGET_CAT))
+            ), 'error');
+            return false;
         }
     }
+    return $valid;
+}, 10, 4);
 
-    if ($contains_target) {
-        $allow = unserialize(MIRAGE_AUTHNET_IDS);
-        foreach ($gateways as $id => $gw) {
-            if (!in_array($id, $allow, true)) unset($gateways[$id]);
-        }
+/* ===== 2) Double-check cart purity before checkout ===== */
+add_action('woocommerce_check_cart_items', function(){
+    $s = mirage_cart_stats();
+    if ($s['merch'] > 0 && $s['other'] > 0){
+        wc_add_notice('Your cart mixes <strong>Merch</strong> with other categories. Please remove one type so the cart is category-pure.', 'error');
     }
-    return $gateways;
-}, 20);
-
-/* ======================
-   Minimal GitHub auto-updater (Releases-based)
-   - Compares Version header to latest GitHub tag (vX.Y.Z)
-   - Supplies package: https://github.com/{repo}/releases/download/vX.Y.Z/mirage-vX.Y.Z.zip
-   ====================== */
-add_filter('pre_set_site_transient_update_plugins', function ($transient) {
-    if (empty($transient->checked)) return $transient;
-
-    $plugin_file = MIRAGE_FILE;
-    $current_ver = get_file_data(WP_PLUGIN_DIR . '/' . $plugin_file, ['Version' => 'Version'])['Version'] ?? '0.0.0';
-
-    // Fetch latest release
-    $resp = wp_remote_get('https://api.github.com/repos/' . MIRAGE_REPO . '/releases/latest', [
-        'headers' => ['Accept' => 'application/vnd.github+json', 'User-Agent' => 'WordPress/' . get_bloginfo('version') . '; ' . home_url('/')],
-        'timeout' => 10,
-    ]);
-    if (is_wp_error($resp)) return $transient;
-    $code = wp_remote_retrieve_response_code($resp);
-    if ($code !== 200) return $transient;
-
-    $data = json_decode(wp_remote_retrieve_body($resp), true);
-    if (!is_array($data) || empty($data['tag_name'])) return $transient;
-
-    $tag = ltrim($data['tag_name'], 'v');
-    if (version_compare($tag, $current_ver, '<=')) return $transient;
-
-    $pkg = sprintf('https://github.com/%s/releases/download/v%s/%s-v%s.zip', MIRAGE_REPO, $tag, MIRAGE_SLUG, $tag);
-
-    $update = new stdClass();
-    $update->slug = MIRAGE_SLUG;
-    $update->plugin = $plugin_file;
-    $update->new_version = $tag;
-    $update->url = 'https://github.com/' . MIRAGE_REPO;
-    $update->package = $pkg;
-
-    $transient->response[$plugin_file] = $update;
-    return $transient;
 });
 
-/* Details modal on Plugins screen (optional but nice) */
-add_filter('plugins_api', function ($res, $action, $args) {
-    if ($action !== 'plugin_information' || empty($args->slug) || $args->slug !== MIRAGE_SLUG) return $res;
+/* ===== 3) Payment gateway rules =====
+   - Merch-only cart  => allow ONLY Authorize.Net
+   - Non-Merch-only   => HIDE Authorize.Net
+*/
+add_filter('woocommerce_available_payment_gateways', function($gateways){
+    if (is_admin() || !is_checkout() || !function_exists('WC') || !WC()->cart) return $gateways;
 
-    $plugin_file = WP_PLUGIN_DIR . '/' . MIRAGE_FILE;
-    $hdr = get_file_data($plugin_file, ['Name'=>'Plugin Name','Version'=>'Version','Author'=>'Author','Description'=>'Description']);
-    $ver = $hdr['Version'] ?? '';
-    $readme = 'https://raw.githubusercontent.com/' . MIRAGE_REPO . '/main/README.md';
+    $authnet_ids = json_decode(MIRAGE_AUTHNET_IDS_JSON, true) ?: [];
+    $s = mirage_cart_stats();
 
-    $resp = wp_remote_get($readme, ['headers'=>['User-Agent'=>'WordPress updater']]);
-    $sections = ['description' => esc_html($hdr['Description'])];
-    if (!is_wp_error($resp) && wp_remote_retrieve_response_code($resp) === 200) {
-        $sections['changelog'] = esc_html(wp_remote_retrieve_body($resp));
+    // Mixed carts should already be blocked; as a safeguard, remove all gateways.
+    if ($s['merch'] > 0 && $s['other'] > 0){
+        return [];
     }
 
-    $obj = new stdClass();
-    $obj->name = $hdr['Name'] ?? 'Mirage';
-    $obj->slug = MIRAGE_SLUG;
-    $obj->version = $ver;
-    $obj->author = esc_html($hdr['Author'] ?? '');
-    $obj->homepage = 'https://github.com/' . MIRAGE_REPO;
-    $obj->sections = $sections;
-    $obj->download_link = sprintf('https://github.com/%s/releases/latest', MIRAGE_REPO);
-    return $obj;
-}, 10, 3);
+    // Merch-only: keep only Authorize.Net
+    if ($s['merch'] > 0 && $s['other'] === 0){
+        foreach ($gateways as $id => $gw){
+            if (!in_array($id, $authnet_ids, true)) unset($gateways[$id]);
+        }
+        return $gateways;
+    }
+
+    // Non-Merch-only: remove Authorize.Net
+    if ($s['other'] > 0 && $s['merch'] === 0){
+        foreach ($authnet_ids as $id){ unset($gateways[$id]); }
+        return $gateways;
+    }
+
+    return $gateways;
+}, 20);
